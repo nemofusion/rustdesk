@@ -1,5 +1,7 @@
 import 'dart:async';
+import 'dart:io';
 
+import 'package:desktop_drop/desktop_drop.dart';
 import 'package:desktop_multi_window/desktop_multi_window.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -14,6 +16,7 @@ import '../../common/widgets/remote_input.dart';
 import '../../common.dart';
 import '../../common/widgets/dialog.dart';
 import '../../common/widgets/toolbar.dart';
+import '../../models/file_model.dart';
 import '../../models/model.dart';
 import '../../models/input_model.dart';
 import '../../models/platform_model.dart';
@@ -440,32 +443,172 @@ class _RemotePageState extends State<RemotePage>
 
     return Scaffold(
       backgroundColor: Theme.of(context).colorScheme.background,
-      body: Obx(() {
-        final imageReady = _ffi.ffiModel.pi.isSet.isTrue &&
-            _ffi.ffiModel.waitForFirstImage.isFalse;
-        if (imageReady) {
-          // If the privacy mode(disable physical displays) is switched,
-          // we should not dismiss the dialog immediately.
-          if (DateTime.now().difference(togglePrivacyModeTime) >
-              const Duration(milliseconds: 3000)) {
-            // `dismissAll()` is to ensure that the state is clean.
-            // It's ok to call dismissAll() here.
-            _ffi.dialogManager.dismissAll();
-            // Recreate the block state to refresh the state.
-            _blockableOverlayState = BlockableOverlayState();
-            _blockableOverlayState.applyFfi(_ffi);
-          }
-          // Block the whole `bodyWidget()` when dialog shows.
-          return BlockableOverlay(
-            underlying: bodyWidget(),
-            state: _blockableOverlayState,
-          );
-        } else {
-          // `_blockableOverlayState` is not recreated here.
-          // The toolbar's block state won't work properly when reconnecting, but that's okay.
-          return bodyWidget();
-        }
-      }),
+      body: DropTarget(
+        onDragEntered: (_) => _dropHover.value = true,
+        onDragExited: (_) => _dropHover.value = false,
+        onDragDone: (detail) {
+          _dropHover.value = false;
+          _handleRemoteDrop(detail);
+        },
+        child: Stack(
+          children: [
+            Obx(() {
+              final imageReady = _ffi.ffiModel.pi.isSet.isTrue &&
+                  _ffi.ffiModel.waitForFirstImage.isFalse;
+              if (imageReady) {
+                // If the privacy mode(disable physical displays) is switched,
+                // we should not dismiss the dialog immediately.
+                if (DateTime.now().difference(togglePrivacyModeTime) >
+                    const Duration(milliseconds: 3000)) {
+                  // `dismissAll()` is to ensure that the state is clean.
+                  // It's ok to call dismissAll() here.
+                  _ffi.dialogManager.dismissAll();
+                  // Recreate the block state to refresh the state.
+                  _blockableOverlayState = BlockableOverlayState();
+                  _blockableOverlayState.applyFfi(_ffi);
+                }
+                // Block the whole `bodyWidget()` when dialog shows.
+                return BlockableOverlay(
+                  underlying: bodyWidget(),
+                  state: _blockableOverlayState,
+                );
+              } else {
+                // `_blockableOverlayState` is not recreated here.
+                // The toolbar's block state won't work properly when reconnecting, but that's okay.
+                return bodyWidget();
+              }
+            }),
+            Obx(() => _dropHover.value
+                ? IgnorePointer(
+                    child: Container(
+                      color: Colors.blue.withOpacity(0.18),
+                      alignment: Alignment.center,
+                      child: Container(
+                        padding: const EdgeInsets.symmetric(
+                            horizontal: 24, vertical: 16),
+                        decoration: BoxDecoration(
+                          color: Colors.black.withOpacity(0.72),
+                          borderRadius: BorderRadius.circular(8),
+                        ),
+                        child: const Text(
+                          'Drop files to send to remote',
+                          style: TextStyle(color: Colors.white, fontSize: 16),
+                        ),
+                      ),
+                    ),
+                  )
+                : const SizedBox.shrink()),
+          ],
+        ),
+      ),
+    );
+  }
+
+  final RxBool _dropHover = false.obs;
+
+  Future<void> _handleRemoteDrop(DropDoneDetails detail) async {
+    if (detail.files.isEmpty) return;
+    if (_ffi.ffiModel.pi.isSet.isFalse) {
+      showToast('Remote not ready');
+      return;
+    }
+
+    final fileModel = _ffi.fileModel;
+    final remoteCtl = fileModel.remoteController;
+    // Remote-control session does not init file model automatically.
+    if (remoteCtl.directory.value.path.isEmpty &&
+        remoteCtl.options.value.home.isEmpty) {
+      unawaited(remoteCtl.onReady());
+    }
+
+    final isPeerWindows =
+        _ffi.ffiModel.pi.platform == kPeerPlatformWindows;
+    String defaultPath = remoteCtl.directory.value.path;
+    if (defaultPath.isEmpty) defaultPath = remoteCtl.options.value.home;
+    if (defaultPath.isEmpty) {
+      defaultPath = isPeerWindows ? r'C:\Users\Public\Desktop' : '/tmp';
+    }
+
+    final targetPath = await _showDropConfirmDialog(defaultPath, detail);
+    if (targetPath == null || targetPath.isEmpty) return;
+
+    for (final xfile in detail.files) {
+      final f = File(xfile.path);
+      final isDir = FileSystemEntity.isDirectorySync(xfile.path);
+      final entry = Entry()
+        ..path = xfile.path
+        ..name = xfile.name
+        ..size = isDir ? 0 : f.lengthSync();
+      // isRemoteToLocal = false => local -> remote upload.
+      final jobID = fileModel.jobController.addTransferJob(entry, false);
+      bind.sessionSendFiles(
+        sessionId: _ffi.sessionId,
+        actId: jobID,
+        path: xfile.path,
+        to: PathUtil.join(targetPath, xfile.name, isPeerWindows),
+        fileNum: 0,
+        includeHidden: false,
+        isRemote: false,
+        isDir: isDir,
+      );
+    }
+    showToast('Uploading ${detail.files.length} item(s) to $targetPath');
+  }
+
+  Future<String?> _showDropConfirmDialog(
+      String defaultPath, DropDoneDetails detail) async {
+    final files = detail.files;
+    final ctl = TextEditingController(text: defaultPath);
+    return showDialog<String>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Transfer files to remote'),
+        content: SizedBox(
+          width: 460,
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text('${files.length} item(s) to send:'),
+              const SizedBox(height: 6),
+              ...files.take(6).map((f) => Padding(
+                    padding: const EdgeInsets.only(left: 8, top: 2),
+                    child: Text('• ${f.name}',
+                        overflow: TextOverflow.ellipsis,
+                        style: const TextStyle(fontSize: 12)),
+                  )),
+              if (files.length > 6)
+                Padding(
+                  padding: const EdgeInsets.only(left: 8, top: 2),
+                  child: Text('... and ${files.length - 6} more',
+                      style: const TextStyle(
+                          fontSize: 12, fontStyle: FontStyle.italic)),
+                ),
+              const SizedBox(height: 14),
+              const Text('Target path on remote:',
+                  style: TextStyle(fontWeight: FontWeight.bold)),
+              const SizedBox(height: 4),
+              TextField(
+                controller: ctl,
+                decoration: const InputDecoration(
+                  isDense: true,
+                  border: OutlineInputBorder(),
+                ),
+              ),
+            ],
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text('Cancel'),
+          ),
+          ElevatedButton(
+            onPressed: () => Navigator.pop(ctx, ctl.text.trim()),
+            child: const Text('Send'),
+          ),
+        ],
+      ),
     );
   }
 
