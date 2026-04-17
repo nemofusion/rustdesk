@@ -1,5 +1,6 @@
 #include "flutter_window.h"
 
+#include <desktop_drop/desktop_drop_plugin.h>
 #include <desktop_multi_window/desktop_multi_window_plugin.h>
 #include <texture_rgba_renderer/texture_rgba_renderer_plugin_c_api.h>
 #include <flutter_gpu_texture_renderer/flutter_gpu_texture_renderer_plugin_c_api.h>
@@ -90,6 +91,13 @@ bool FlutterWindow::OnCreate() {
         registry->GetRegistrarForPlugin("TextureRgbaRendererPlugin"));
     FlutterGpuTextureRendererPluginCApiRegisterWithRegistrar(
         registry->GetRegistrarForPlugin("FlutterGpuTextureRendererPluginCApi"));
+    // Register desktop_drop for secondary windows so OS-level drag-and-drop
+    // events are delivered to the Flutter DropTarget widget in the remote
+    // control window. Without this, the remote canvas (rendered in a
+    // desktop_multi_window secondary window) is not a registered
+    // RegisterDragDrop target and Windows shows the "prohibited" cursor.
+    DesktopDropPluginRegisterWithRegistrar(
+        registry->GetRegistrarForPlugin("DesktopDropPlugin"));
   });
   SetChildContent(flutter_controller_->view()->GetNativeWindow());
   return true;
